@@ -1,0 +1,21 @@
+# Normalize line endings on commit, check out native on each platform.
+* text=auto
+
+*.ino  text diff=cpp
+*.h    text diff=cpp
+*.cpp  text diff=cpp
+*.rc   text
+*.py   text diff=python
+*.md   text
+*.ini  text
+
+# Windows-only sources are checked out with CRLF.
+*.rc   text eol=crlf
+
+# Binary assets — never diffed or line-ending converted.
+*.ico  binary
+*.exe  binary
+*.dll  binary
+*.sys  binary
+*.bin  binary
+*.elf  binary

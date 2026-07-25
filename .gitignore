@@ -67,3 +67,36 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# ─── Arduino / ESP32 build output ────────────────────────────────────────────
+*.bin
+*.elf
+*.map
+*.hex
+*.uf2
+.arduino15/
+*.ino.cpp
+
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ─── PC_Hardware_Monitor: third-party & machine-local files ──────────────────
+# LibreHardwareMonitor redistributable (~5 MB, incl. signed kernel driver).
+# Download it yourself — see PC_Hardware_Monitor_ESP32C6/README.md.
+PC_Hardware_Monitor_ESP32C6/host_python/lhm/
+# Per-machine COM port selection, written next to the tray executable.
+pc_monitor_config.ini
+# Runtime log written next to the tray executable (also matched by *.log).
+pc_monitor_debug.log
+
+# ─── Editors / tooling / OS ──────────────────────────────────────────────────
+.claude/settings.local.json
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
