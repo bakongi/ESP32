@@ -38,6 +38,9 @@
 *.exe
 *.out
 *.app
+# ...except the released tray app, shipped so it can be run without MinGW.
+# Rebuild it from tray_app/ before committing a new version.
+!PC_Hardware_Monitor_ESP32C6/PC_Monitor_Tray.exe
 
 # Build directories
 build/

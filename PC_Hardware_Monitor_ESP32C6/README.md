@@ -86,7 +86,7 @@ CPU:16;RAM:36;TEMP:53;GPU:8;GPUTEMP:47;VRAM:18
 
 ## 🚀 Нативное приложение Windows (`PC_Monitor_Tray.exe`)
 
-Исходники лежат в [`tray_app/`](tray_app/); готовый `PC_Monitor_Tray.exe` в репозиторий не коммитится — соберите его командой из раздела [Сборка проекта из исходников](#-сборка-проекта-из-исходников).
+Готовое приложение [`PC_Monitor_Tray.exe`](PC_Monitor_Tray.exe) лежит в папке проекта — его можно скачать и запустить без установки компилятора. Исходники — в [`tray_app/`](tray_app/), пересборка описана в разделе [Сборка проекта из исходников](#-сборка-проекта-из-исходников).
 
 ### Функция правого клика по иконке в трее (у часов):
 - **`▶ Streaming Active / ⏸ Paused`** — Мгновенный запуск и пауза трансляции.
@@ -137,7 +137,7 @@ temperature_sensor_get_celsius(temp_handle, &tsens_out);
 | `PC_Hardware_Monitor_ESP32C6.ino` | Прошивка платы (Arduino-скетч) |
 | `tray_app/` | Исходники нативного приложения Windows: `pc_monitor_tray.cpp`, `resource.rc`, `app_icon.ico` |
 | `host_python/` | Альтернативный хост на Python (`pc_monitor_sender.py`) и папка `lhm/` для LibreHardwareMonitor |
-| `PC_Monitor_Tray.exe` | Собранное приложение (не хранится в git, собирается из `tray_app/`) |
+| `PC_Monitor_Tray.exe` | Собранное приложение (хранится в репозитории, пересобирается из `tray_app/`) |
 | `pc_monitor_config.ini`, `pc_monitor_debug.log` | Создаются приложением рядом с `.exe`, специфичны для машины (в `.gitignore`) |
 
 Файлы `.cpp` и `.h` лежат в подпапке `tray_app/` намеренно: Arduino IDE компилирует все исходники из корня папки скетча, и хост-приложение Windows попало бы в сборку прошивки.
