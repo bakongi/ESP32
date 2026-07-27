@@ -19,7 +19,11 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <winreg.h>
+#include <pdh.h>
+#include <pdhmsg.h>
+#include <dxgi1_4.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <vector>
 #include <string>
 
@@ -64,8 +68,10 @@ int g_cpuLoad = 0;
 int g_cpuTemp = 48;
 int g_ramLoad = 0;
 int g_gpuLoad = 0;
-int g_gpuTemp = 45;
+int g_gpuTemp = 0;
 int g_vramLoad = 0;
+BOOL g_gpuMetricsAvailable = FALSE;
+BOOL g_gpuMetricsAreNvidia = FALSE;
 
 // CPU Calculation Times
 FILETIME g_prevIdleTime = { 0 };
@@ -119,6 +125,255 @@ int CalculateRamLoad() {
         return (int)memStatus.dwMemoryLoad;
     }
     return 0;
+}
+
+// Query NVIDIA's driver utility rather than inferring GPU values from CPU/RAM.
+// The values returned by this command match the NVIDIA GPU shown in Task Manager:
+// GPU core utilization, GPU temperature, and used/total dedicated VRAM.
+BOOL QueryNvidiaGpuMetrics(int& gpuLoad, int& gpuTemp, int& vramLoad) {
+    wchar_t systemDir[MAX_PATH];
+    UINT systemDirLen = GetSystemDirectoryW(systemDir, MAX_PATH);
+    if (systemDirLen == 0 || systemDirLen >= MAX_PATH) {
+        return FALSE;
+    }
+
+    wchar_t nvidiaSmiPath[MAX_PATH];
+    swprintf(nvidiaSmiPath, MAX_PATH, L"%ls\\nvidia-smi.exe", systemDir);
+    if (GetFileAttributesW(nvidiaSmiPath) == INVALID_FILE_ATTRIBUTES) {
+        return FALSE;
+    }
+
+    SECURITY_ATTRIBUTES security = { 0 };
+    security.nLength = sizeof(security);
+    security.bInheritHandle = TRUE;
+
+    HANDLE readPipe = NULL;
+    HANDLE writePipe = NULL;
+    if (!CreatePipe(&readPipe, &writePipe, &security, 0)) {
+        return FALSE;
+    }
+    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+
+    wchar_t commandLine[512];
+    swprintf(commandLine, 512,
+             L"\"%ls\" --query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total --format=csv,noheader,nounits -i 0",
+             nvidiaSmiPath);
+
+    STARTUPINFOW startupInfo = { 0 };
+    startupInfo.cb = sizeof(startupInfo);
+    startupInfo.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+    startupInfo.wShowWindow = SW_HIDE;
+    startupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startupInfo.hStdOutput = writePipe;
+    startupInfo.hStdError = writePipe;
+
+    PROCESS_INFORMATION processInfo = { 0 };
+    BOOL created = CreateProcessW(NULL, commandLine, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                                  NULL, NULL, &startupInfo, &processInfo);
+    CloseHandle(writePipe);
+
+    if (!created) {
+        CloseHandle(readPipe);
+        return FALSE;
+    }
+
+    DWORD waitResult = WaitForSingleObject(processInfo.hProcess, 2000);
+    if (waitResult != WAIT_OBJECT_0) {
+        TerminateProcess(processInfo.hProcess, 1);
+        CloseHandle(processInfo.hThread);
+        CloseHandle(processInfo.hProcess);
+        CloseHandle(readPipe);
+        return FALSE;
+    }
+
+    char output[256] = { 0 };
+    DWORD bytesRead = 0;
+    BOOL readOk = ReadFile(readPipe, output, sizeof(output) - 1, &bytesRead, NULL);
+    CloseHandle(processInfo.hThread);
+    CloseHandle(processInfo.hProcess);
+    CloseHandle(readPipe);
+    if (!readOk || bytesRead == 0) {
+        return FALSE;
+    }
+
+    int usedMiB = 0;
+    int totalMiB = 0;
+    if (sscanf(output, "%d , %d , %d , %d", &gpuLoad, &gpuTemp, &usedMiB, &totalMiB) != 4 ||
+        gpuLoad < 0 || gpuLoad > 100 || gpuTemp < 0 || gpuTemp > 130 ||
+        usedMiB < 0 || totalMiB <= 0 || usedMiB > totalMiB) {
+        return FALSE;
+    }
+
+    // The firmware expects a percentage, not a MiB value.
+    vramLoad = (usedMiB * 100 + totalMiB / 2) / totalMiB;
+    return TRUE;
+}
+
+struct WindowsGpuEngineLoad {
+    LUID luid;
+    double load;
+};
+
+struct WindowsGpuAdapterInfo {
+    LUID luid;
+    int vramLoad;
+};
+
+BOOL IsSameLuid(const LUID& left, const LUID& right) {
+    return left.LowPart == right.LowPart && left.HighPart == right.HighPart;
+}
+
+// Reads the same GPU-engine counters used by Windows Task Manager. A counter
+// represents a single engine, so use the busiest engine for each adapter
+// instead of summing parallel 3D, compute, encode, and copy engines.
+BOOL ReadWindowsGpuEngineLoads(std::vector<WindowsGpuEngineLoad>& loads) {
+    static PDH_HQUERY query = NULL;
+    static PDH_HCOUNTER counter = NULL;
+    static BOOL hasPreviousSample = FALSE;
+
+    if (query == NULL) {
+        if (PdhOpenQueryW(NULL, 0, &query) != ERROR_SUCCESS ||
+            PdhAddEnglishCounterW(query, L"\\GPU Engine(*)\\Utilization Percentage", 0, &counter) != ERROR_SUCCESS) {
+            if (query != NULL) {
+                PdhCloseQuery(query);
+                query = NULL;
+            }
+            return FALSE;
+        }
+    }
+
+    if (PdhCollectQueryData(query) != ERROR_SUCCESS) {
+        return FALSE;
+    }
+    if (!hasPreviousSample) {
+        hasPreviousSample = TRUE;
+        return FALSE;
+    }
+
+    DWORD bufferSize = 0;
+    DWORD itemCount = 0;
+    PDH_STATUS status = PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE,
+                                                      &bufferSize, &itemCount, NULL);
+    if (status != PDH_MORE_DATA || bufferSize == 0 || itemCount == 0) {
+        return FALSE;
+    }
+
+    std::vector<BYTE> buffer(bufferSize);
+    PDH_FMT_COUNTERVALUE_ITEM_W* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data());
+    status = PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &bufferSize, &itemCount, items);
+    if (status != ERROR_SUCCESS) {
+        return FALSE;
+    }
+
+    for (DWORD i = 0; i < itemCount; ++i) {
+        if (items[i].FmtValue.CStatus != ERROR_SUCCESS || items[i].FmtValue.doubleValue < 0.0) {
+            continue;
+        }
+
+        const wchar_t* luidText = wcsstr(items[i].szName, L"_luid_0x");
+        unsigned long highPart = 0;
+        unsigned long lowPart = 0;
+        if (luidText == NULL || swscanf(luidText, L"_luid_0x%lx_0x%lx", &highPart, &lowPart) != 2) {
+            continue;
+        }
+
+        LUID luid = { 0 };
+        luid.HighPart = static_cast<LONG>(highPart);
+        luid.LowPart = static_cast<DWORD>(lowPart);
+
+        double engineLoad = items[i].FmtValue.doubleValue;
+        if (engineLoad > 100.0) engineLoad = 100.0;
+        BOOL found = FALSE;
+        for (size_t j = 0; j < loads.size(); ++j) {
+            if (IsSameLuid(loads[j].luid, luid)) {
+                if (engineLoad > loads[j].load) loads[j].load = engineLoad;
+                found = TRUE;
+                break;
+            }
+        }
+        if (!found) {
+            WindowsGpuEngineLoad load = { luid, engineLoad };
+            loads.push_back(load);
+        }
+    }
+    return !loads.empty();
+}
+
+// DXGI exposes local video-memory use for hardware adapters from any vendor.
+BOOL ReadWindowsGpuAdapters(std::vector<WindowsGpuAdapterInfo>& adapters) {
+    IDXGIFactory1* factory = NULL;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) {
+        return FALSE;
+    }
+
+    for (UINT index = 0; ; ++index) {
+        IDXGIAdapter1* adapter = NULL;
+        HRESULT result = factory->EnumAdapters1(index, &adapter);
+        if (result == DXGI_ERROR_NOT_FOUND) break;
+        if (FAILED(result)) continue;
+
+        DXGI_ADAPTER_DESC1 description = { 0 };
+        if (SUCCEEDED(adapter->GetDesc1(&description)) &&
+            !(description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+            WindowsGpuAdapterInfo info = { description.AdapterLuid, 0 };
+            IDXGIAdapter3* adapter3 = NULL;
+            if (SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3), reinterpret_cast<void**>(&adapter3)))) {
+                DXGI_QUERY_VIDEO_MEMORY_INFO memoryInfo = { 0 };
+                if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memoryInfo)) &&
+                    memoryInfo.Budget > 0) {
+                    UINT64 load = (memoryInfo.CurrentUsage * 100 + memoryInfo.Budget / 2) / memoryInfo.Budget;
+                    info.vramLoad = (load > 100) ? 100 : static_cast<int>(load);
+                }
+                adapter3->Release();
+            }
+            adapters.push_back(info);
+        }
+        adapter->Release();
+    }
+    factory->Release();
+    return !adapters.empty();
+}
+
+// Vendor-neutral fallback for Intel and AMD. Temperature intentionally remains
+// zero because Windows has no standard, trustworthy GPU-temperature API.
+BOOL QueryWindowsGpuMetrics(int& gpuLoad, int& gpuTemp, int& vramLoad) {
+    std::vector<WindowsGpuEngineLoad> engineLoads;
+    std::vector<WindowsGpuAdapterInfo> adapters;
+    BOOL hasEngineLoad = ReadWindowsGpuEngineLoads(engineLoads);
+    if (!ReadWindowsGpuAdapters(adapters)) {
+        return FALSE;
+    }
+
+    int selectedAdapter = 0;
+    double selectedLoad = -1.0;
+    if (hasEngineLoad) {
+        for (size_t adapterIndex = 0; adapterIndex < adapters.size(); ++adapterIndex) {
+            for (size_t loadIndex = 0; loadIndex < engineLoads.size(); ++loadIndex) {
+                if (IsSameLuid(adapters[adapterIndex].luid, engineLoads[loadIndex].luid) &&
+                    engineLoads[loadIndex].load > selectedLoad) {
+                    selectedLoad = engineLoads[loadIndex].load;
+                    selectedAdapter = static_cast<int>(adapterIndex);
+                }
+            }
+        }
+    }
+
+    // Before the first PDH delta is available, choose the adapter using the
+    // most local-memory activity so VRAM can be reported immediately.
+    if (selectedLoad < 0.0) {
+        for (size_t i = 1; i < adapters.size(); ++i) {
+            if (adapters[i].vramLoad > adapters[selectedAdapter].vramLoad) {
+                selectedAdapter = static_cast<int>(i);
+            }
+        }
+        selectedLoad = 0.0;
+    }
+
+    gpuLoad = static_cast<int>(selectedLoad + 0.5);
+    if (gpuLoad > 100) gpuLoad = 100;
+    gpuTemp = 0;
+    vramLoad = adapters[selectedAdapter].vramLoad;
+    return TRUE;
 }
 
 // ─── Background Streaming Worker Thread ──────────────────────────────────────
@@ -443,9 +698,47 @@ void CollectSystemMetrics() {
     g_ramLoad = CalculateRamLoad();
 
     g_cpuTemp = 48 + (int)(g_cpuLoad * 0.35f);
-    g_gpuLoad = (int)(g_cpuLoad * 0.5f);
-    g_gpuTemp = 45 + (int)(g_gpuLoad * 0.30f);
-    g_vramLoad = (int)(g_ramLoad * 0.5f);
+
+    // GPU collection runs once per second while the serial stream continues at
+    // its normal 400 ms cadence.
+    static DWORD lastGpuPoll = 0;
+    DWORD now = GetTickCount();
+    if (lastGpuPoll == 0 || now - lastGpuPoll >= 1000) {
+        lastGpuPoll = now;
+        int gpuLoad = 0;
+        int gpuTemp = 0;
+        int vramLoad = 0;
+        BOOL isNvidiaTelemetry = QueryNvidiaGpuMetrics(gpuLoad, gpuTemp, vramLoad);
+        BOOL querySucceeded = isNvidiaTelemetry;
+        if (!querySucceeded) {
+            querySucceeded = QueryWindowsGpuMetrics(gpuLoad, gpuTemp, vramLoad);
+        }
+
+        if (querySucceeded) {
+            if (!g_gpuMetricsAvailable || g_gpuMetricsAreNvidia != isNvidiaTelemetry) {
+                if (isNvidiaTelemetry) {
+                    LogDebug("NVIDIA GPU telemetry is available via nvidia-smi.");
+                } else {
+                    LogDebug("Windows GPU telemetry is available via PDH/DXGI; GPU temperature is 0 for non-NVIDIA adapters.");
+                }
+            }
+            g_gpuLoad = gpuLoad;
+            g_gpuTemp = gpuTemp;
+            g_vramLoad = vramLoad;
+            g_gpuMetricsAvailable = TRUE;
+            g_gpuMetricsAreNvidia = isNvidiaTelemetry;
+        } else {
+            if (g_gpuMetricsAvailable) {
+                LogDebug("GPU telemetry is unavailable; sending 0 for GPU metrics.");
+            }
+            // Do not substitute CPU/RAM-derived values when all GPU queries fail.
+            g_gpuLoad = 0;
+            g_gpuTemp = 0;
+            g_vramLoad = 0;
+            g_gpuMetricsAvailable = FALSE;
+            g_gpuMetricsAreNvidia = FALSE;
+        }
+    }
 
     if (g_hSerial != INVALID_HANDLE_VALUE) {
         swprintf(g_nid.szTip, 128, L"ESP32 Monitor [%s] - Streaming\nCPU: %d%% (%d°C) | RAM: %d%%",

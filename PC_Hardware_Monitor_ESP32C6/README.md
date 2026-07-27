@@ -146,7 +146,7 @@ temperature_sensor_get_celsius(temp_handle, &tsens_out);
 ```powershell
 cd J:\ESP32\PC_Hardware_Monitor_ESP32C6\tray_app
 windres resource.rc -O coff -o resource.o
-g++ -O2 -mwindows -municode -o ..\PC_Monitor_Tray.exe pc_monitor_tray.cpp resource.o -lkernel32 -luser32 -lgdi32 -lshell32 -ladvapi32
+g++ -O2 -mwindows -municode -o ..\PC_Monitor_Tray.exe pc_monitor_tray.cpp resource.o -lkernel32 -luser32 -lgdi32 -lshell32 -ladvapi32 -lpdh -ldxgi
 ```
 
 ### Запуск Python-хоста (опционально):
